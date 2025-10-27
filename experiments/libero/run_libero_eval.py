@@ -23,83 +23,65 @@ import tqdm
 import ast
 from libero.libero import benchmark
 
+# Add project root to sys.path for VQVAE import
+import sys
+import os
+current_file = os.path.abspath(__file__)
+libero_exp_dir = os.path.dirname(current_file)
+molmoact_dir = os.path.dirname(os.path.dirname(libero_exp_dir))
+project_root = os.path.dirname(molmoact_dir)
+sys.path.append(project_root)
 
-def detokenize_depth_map(depth_tokens):
+# Add AiT/vae to sys.path for models import
+ait_vae_dir = os.path.join(project_root, "AiT", "vae")
+sys.path.append(ait_vae_dir)
+
+from models.VQVAE import VQVAE
+import torchvision.transforms as transforms
+
+
+def detokenize_depth_map(depth_tokens, vae_model):
     """
-    Convert discrete depth tokens to a depth map for visualization.
-    
-    The depth tokens appear to be learned discrete representations where:
-    - Each <DEPTH_X> represents a quantized depth value
-    - Higher numbers likely represent farther depth
-    - Tokens are arranged in raster scan order of a downsampled depth map
-    
-    Args:
-        depth_tokens: List of depth token strings
-        
-    Returns:
-        2D numpy array representing depth values, or None if parsing fails
+    Convert discrete depth tokens to a depth map using the VQ-VAE decoder.
     """
-    if not depth_tokens or len(depth_tokens) == 0:
+    if not depth_tokens or len(depth_tokens) == 0 or vae_model is None:
         return None
-    
+
     for depth_str in depth_tokens:
         if isinstance(depth_str, str):
-            # Remove start/end tags and extract depth token indices
             content = re.sub(r'<DEPTH_START>|<DEPTH_END>', '', depth_str).strip()
             if content:
                 try:
-                    # Extract all depth token numbers
                     depth_indices = re.findall(r'<DEPTH_(\d+)>', content)
-                    
                     if depth_indices:
-                        # Convert to numpy array of integers
                         depth_values = np.array([int(idx) for idx in depth_indices])
                         
-                        print(f"Extracted {len(depth_values)} depth tokens")
-                        print(f"Depth range: {np.min(depth_values)} - {np.max(depth_values)}")
+                        # The VQ-VAE expects a 10x10 grid of tokens
+                        if len(depth_values) != 100:
+                            print(f"Warning: Expected 100 depth tokens, but found {len(depth_values)}. Padding/truncating.")
+                            if len(depth_values) > 100:
+                                depth_values = depth_values[:100]
+                            else:
+                                depth_values = np.pad(depth_values, (0, 100 - len(depth_values)), 'edge')
+
+                        codes = torch.from_numpy(depth_values).long().cuda().reshape(1, 10, 10)
                         
-                        # Determine grid dimensions
-                        # Common choices: 16x16=256, 24x24=576, 32x32=1024
-                        total_tokens = len(depth_values)
+                        with torch.no_grad():
+                            # Use the VQ-VAE decoder
+                            decoded_image = vae_model.decode_from_code(codes)
                         
-                        # Try to find square dimensions that fit
-                        grid_size = int(np.sqrt(total_tokens))
+                        # Post-process the decoded image
+                        depth_map = decoded_image.squeeze().cpu().numpy()
                         
-                        # Check if it's a perfect square, otherwise find best fit
-                        if grid_size * grid_size != total_tokens:
-                            # Try common depth map sizes
-                            common_sizes = [8, 12, 16, 20, 24, 32, 48, 64]
-                            best_fit = 16  # default
-                            
-                            for size in common_sizes:
-                                if size * size <= total_tokens:
-                                    best_fit = size
-                                else:
-                                    break
-                            grid_size = best_fit
+                        # Normalize for visualization
+                        depth_map = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
                         
-                        # Reshape into 2D depth map
-                        required_tokens = grid_size * grid_size
-                        
-                        if total_tokens >= required_tokens:
-                            # Use first required_tokens
-                            depth_map = depth_values[:required_tokens].reshape(grid_size, grid_size)
-                        else:
-                            # Pad with median value if needed
-                            median_val = np.median(depth_values)
-                            padded = np.pad(depth_values, (0, required_tokens - total_tokens), 
-                                          mode='constant', constant_values=median_val)
-                            depth_map = padded.reshape(grid_size, grid_size)
-                        
-                        print(f"Created depth map: {depth_map.shape}")
-                        print(f"Depth map stats: min={np.min(depth_map)}, max={np.max(depth_map)}, mean={np.mean(depth_map):.1f}")
-                        
+                        print(f"Created depth map from VQ-VAE: {depth_map.shape}")
                         return depth_map.astype(np.float32)
-                        
+
                 except Exception as e:
-                    print(f"Error processing depth tokens: {e}")
+                    print(f"Error processing depth tokens with VQ-VAE: {e}")
                     continue
-    
     return None
 
 
@@ -322,7 +304,7 @@ def step(img, wrist_img, language_instruction, model, processor, unnorm_key):
 
 
 # @draccus.wrap()
-def eval_libero(args, processor, model, task_suite_name, checkpoint, seed, model_family, num_trials_per_task, num_steps_wait) -> None:
+def eval_libero(args, processor, model, task_suite_name, checkpoint, seed, model_family, num_trials_per_task, num_steps_wait, vae_model) -> None:
 
     set_seed_everywhere(seed)
 
@@ -438,7 +420,7 @@ def eval_libero(args, processor, model, task_suite_name, checkpoint, seed, model
                         
                         # Add depth visualization as background overlay
                         if depth_tokens is not None and len(depth_tokens) > 0:
-                            depth_map = detokenize_depth_map(depth_tokens)
+                            depth_map = detokenize_depth_map(depth_tokens, vae_model)
                             if depth_map is not None:
                                 visualize_annotated = visualize_depth_overlay(visualize_annotated, depth_map, alpha=0.4)
                         
@@ -517,6 +499,35 @@ def main():
 
     set_seed_everywhere(seed)
     
+    # Initialize VQ-VAE model
+    cfg_model = dict(
+        image_size=320,
+        num_resnet_blocks=2,
+        downsample_ratio=32,
+        num_tokens=128,
+        codebook_dim=512,
+        hidden_dim=16,
+        use_norm=False,
+        channels=1,
+        train_objective='regression',
+        max_value=10.,
+        residul_type='v1',
+        loss_type='mse',
+    )
+    vae_model = VQVAE(**cfg_model).cuda()
+    
+    # You need to provide the correct path to your VQ-VAE model checkpoint
+    vqvae_model_path = os.path.join(project_root, "AiT", "vae", "checkpoints", "something.pth") # Or get from args
+    
+    ckpt_vae = torch.load(vqvae_model_path)['weights']
+    if 'module' in list(ckpt_vae.keys())[0]:
+        new_ckpt = {key[7:]: val for key, val in ckpt_vae.items()}
+        vae_model.load_state_dict(new_ckpt)
+    else:
+        vae_model.load_state_dict(ckpt_vae)
+    
+    vae_model = torch.nn.DataParallel(vae_model).cuda()
+    vae_model.eval()
 
 
     processor = AutoProcessor.from_pretrained(
@@ -540,7 +551,7 @@ def main():
     
     if args.task_id is not None:
         print(f"Running single task ID: {args.task_id}")
-        eval_libero(args, processor, model, task_suite_name, ckpt, seed, model_family, num_trials_per_task, num_steps_wait)
+        eval_libero(args, processor, model, task_suite_name, ckpt, seed, model_family, num_trials_per_task, num_steps_wait, vae_model)
     else:
         # Run all task IDs 0-9 for the specified task type
         print(f"Running all task IDs 0-9 for task type: {args.task}")
@@ -549,7 +560,7 @@ def main():
             print(f"Running task ID: {task_id}")
             print(f"{'='*50}")
             args.task_id = task_id
-            eval_libero(args, processor, model, task_suite_name, ckpt, seed, model_family, num_trials_per_task, num_steps_wait)
+            eval_libero(args, processor, model, task_suite_name, ckpt, seed, model_family, num_trials_per_task, num_steps_wait, vae_model)
 
 if __name__ == "__main__":
     main()
